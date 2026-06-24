@@ -522,7 +522,7 @@ def build_scan_grid(scroll_frame, fights, frame_key,
 class TorikumiRow(tk.Frame):
     ROW_H = 48
 
-    def __init__(self, parent, bout: dict, fight_options: list[str],
+    def __init__(self, parent, bout: dict, fight_options: list[tuple[int, str]],
                  on_assign, on_upload, scroll_frame, **kw):
         super().__init__(parent, bg=UNASSIGNED_BG,
                          highlightbackground=UNASSIGNED_BD,
@@ -532,6 +532,7 @@ class TorikumiRow(tk.Frame):
         self._on_upload = on_upload
         self._scroll = scroll_frame
         self._has_matched_fight = False
+        self._fight_options = fight_options  # Store tuples of (fight_number, label)
 
         r1_kanji = get_rikishi_kanji(bout, 1)
         r2_kanji = get_rikishi_kanji(bout, 2)
@@ -581,10 +582,10 @@ class TorikumiRow(tk.Frame):
         self._badge.pack(side=tk.LEFT, padx=(12, 4))
 
         # combo for manual assignment
-        options = ["— none —"] + fight_options
-        self._var = tk.StringVar(value=options[0])
+        combo_values = ["— none —"] + [opt[1] for opt in fight_options]
+        self._var = tk.StringVar(value=combo_values[0])
         self._combo = ttk.Combobox(inner, textvariable=self._var,
-                                   values=options, state="readonly",
+                                   values=combo_values, state="readonly",
                                    width=24, font=("Segoe UI", 9))
         self._combo.pack(side=tk.LEFT, padx=4)
         self._combo.bind("<<ComboboxSelected>>", self._on_combo)
@@ -651,12 +652,16 @@ class TorikumiRow(tk.Frame):
         if val == "— none —":
             self._on_assign(bout_id, None)
         else:
-            self._on_assign(bout_id, val)
+            # Find the fight_number corresponding to this text label
+            fight_num = next((num for num, txt in self._fight_options if txt == val), None)
+            self._on_assign(bout_id, fight_num)
 
     def _on_upload_clicked(self):
         val = self._var.get()
         if val and val != "— none —":
-            self._on_upload(self._bout.get("id"), val, self)
+            fight_num = next((num for num, txt in self._fight_options if txt == val), None)
+            if fight_num is not None:
+                self._on_upload(self._bout.get("id"), fight_num, self)
 
 
 # ============================================================
@@ -710,8 +715,8 @@ class SumoVerifierApp(tk.Tk):
         # ── Torikumi state ───────────────────────────────────
         self._torikumi_bouts = []
         self._torikumi_rows = []
-        self._torikumi_assign: dict[int, str | None] = {}
-        self._fight_to_bout: dict[str, int | None] = {}
+        self._torikumi_assign: dict[int, int | None] = {}  # maps bout_id -> fight_number
+        self._fight_to_bout: dict[int, int | None] = {}  # maps fight_number -> bout_id
         self._torikumi_basho_id = None
         self._torikumi_day = None
         self._torikumi_thread = None
@@ -1856,7 +1861,7 @@ class SumoVerifierApp(tk.Tk):
         assigned_fights: set[int] = set()
         assigned_bouts: set = set()
 
-        new_assign: dict[int, str | None] = {
+        new_assign: dict[int, int | None] = {
             b.get("id"): None for b in bouts
         }
         self._fight_to_bout = {}
@@ -1867,9 +1872,9 @@ class SumoVerifierApp(tk.Tk):
             if fidx in assigned_fights:
                 continue
             fight = fights[fidx]
-            label = self._fight_label(fight)
-            new_assign[bout_id] = label
-            self._fight_to_bout[label] = bout_id
+            fnum = fight["fight_number"]
+            new_assign[bout_id] = fnum
+            self._fight_to_bout[fnum] = bout_id
             assigned_fights.add(fidx)
             assigned_bouts.add(bout_id)
 
@@ -1899,19 +1904,17 @@ class SumoVerifierApp(tk.Tk):
             self._render_torikumi_empty("No bouts returned by the API.")
             return
 
-        fight_options = [self._fight_label(f) for f in fights]
+        # Pass a list of tuples: (fight_number, label) to keep logic stable
+        fight_options = [(f["fight_number"], self._fight_label(f)) for f in fights]
 
         score_cache: dict[int, tuple[float, bool]] = {}
         for bout in bouts:
             bout_id = bout.get("id")
-            label = self._torikumi_assign.get(bout_id)
-            if label:
-                fidx = next(
-                    (i for i, f in enumerate(fights)
-                     if self._fight_label(f) == label), None)
-                if fidx is not None:
-                    _, score, partial = match_fight_to_bout(
-                        fights[fidx], [bout])
+            fnum = self._torikumi_assign.get(bout_id)
+            if fnum is not None:
+                fight = next((f for f in fights if f["fight_number"] == fnum), None)
+                if fight:
+                    _, score, partial = match_fight_to_bout(fight, [bout])
                     score_cache[bout_id] = (score, partial)
 
         for bout in bouts:
@@ -1927,8 +1930,9 @@ class SumoVerifierApp(tk.Tk):
             row.pack(fill=tk.X, padx=6, pady=2)
             self._torikumi_rows.append(row)
 
-            label = self._torikumi_assign.get(bout_id)
-            if label:
+            fnum = self._torikumi_assign.get(bout_id)
+            if fnum is not None:
+                label = next((txt for num, txt in fight_options if num == fnum), None)
                 sc, pt = score_cache.get(bout_id, (0.0, False))
                 row.set_assignment(label, pt, sc)
             else:
@@ -1940,9 +1944,8 @@ class SumoVerifierApp(tk.Tk):
 
     def _update_summary_stats(self):
         total_bouts = len(self._torikumi_bouts)
-        assigned_bouts = sum(1 for v in self._torikumi_assign.values() if v)
+        assigned_bouts = sum(1 for v in self._torikumi_assign.values() if v is not None)
 
-        # Division-by-Division Match Statistics (how many local file fights matched)
         total_fights = len(self.json_data.get("fights", []))
         matched_fights = len(set(v for v in self._torikumi_assign.values() if v is not None))
 
@@ -1954,35 +1957,32 @@ class SumoVerifierApp(tk.Tk):
     # ============================================================
     # MANUAL OVERRIDE
     # ============================================================
-    def _on_manual_assign(self, bout_id, fight_label_or_none):
-        old_label = self._torikumi_assign.get(bout_id)
-        if old_label and old_label in self._fight_to_bout:
-            del self._fight_to_bout[old_label]
+    def _on_manual_assign(self, bout_id, fight_num_or_none):
+        old_fnum = self._torikumi_assign.get(bout_id)
+        if old_fnum and old_fnum in self._fight_to_bout:
+            del self._fight_to_bout[old_fnum]
 
-        if fight_label_or_none:
-            for bid, lbl in list(self._torikumi_assign.items()):
-                if lbl == fight_label_or_none and bid != bout_id:
+        if fight_num_or_none is not None:
+            for bid, fnum in list(self._torikumi_assign.items()):
+                if fnum == fight_num_or_none and bid != bout_id:
                     self._torikumi_assign[bid] = None
                     self._update_row_widget(bid, None, False, 0.0)
 
-        self._torikumi_assign[bout_id] = fight_label_or_none
-        if fight_label_or_none:
-            self._fight_to_bout[fight_label_or_none] = bout_id
+        self._torikumi_assign[bout_id] = fight_num_or_none
+        if fight_num_or_none is not None:
+            self._fight_to_bout[fight_num_or_none] = bout_id
 
-        if fight_label_or_none:
+        if fight_num_or_none is not None:
             fights = self.json_data.get("fights", [])
             bouts = self._torikumi_bouts
             bout = next((b for b in bouts if b.get("id") == bout_id), None)
-            fidx = next(
-                (i for i, f in enumerate(fights)
-                 if self._fight_label(f) == fight_label_or_none), None)
-            if bout and fidx is not None:
-                _, score, partial = match_fight_to_bout(fights[fidx], [bout])
-                self._update_row_widget(bout_id, fight_label_or_none,
-                                        partial, score)
+            fight = next((f for f in fights if f["fight_number"] == fight_num_or_none), None)
+            if bout and fight:
+                _, score, partial = match_fight_to_bout(fight, [bout])
+                label = self._fight_label(fight)
+                self._update_row_widget(bout_id, label, partial, score)
             else:
-                self._update_row_widget(bout_id, fight_label_or_none,
-                                        True, 0.0)
+                self._update_row_widget(bout_id, "— none —", True, 0.0)
         else:
             self._update_row_widget(bout_id, None, False, 0.0)
 
@@ -1998,28 +1998,28 @@ class SumoVerifierApp(tk.Tk):
     # ============================================================
     # AUTOMATED ASYNCHRONOUS VIDEO UPLOADER
     # ============================================================
-    def _get_cut_file_path(self, fight_label: str):
+    def _get_cut_file_path(self, fight_num: int):
         fights = self.json_data.get("fights", [])
         for fight in fights:
-            if self._fight_label(fight) == fight_label:
+            if fight.get("fight_number") == fight_num:
                 out_name = build_output_name(self.current_video_path, fight)
                 return os.path.join(CUT_OUTPUT_DIR, out_name), fight
         return None, None
 
-    def _on_upload_request(self, bout_id, fight_label, row_widget):
+    def _on_upload_request(self, bout_id, fight_num, row_widget):
         if not self.access_token:
             messagebox.showerror("Auth Error", "You must log in to upload videos.")
             return
 
         row_widget.update_upload_state(True, "Verifying clip...")
         threading.Thread(target=self._run_upload_flow_bg,
-                         args=(bout_id, fight_label, row_widget),
+                         args=(bout_id, fight_num, row_widget),
                          daemon=True).start()
 
-    def _run_upload_flow_bg(self, bout_id, fight_label, row_widget):
+    def _run_upload_flow_bg(self, bout_id, fight_num, row_widget):
         try:
-            # 1. Fetch file paths and local metadata
-            file_path, fight = self._get_cut_file_path(fight_label)
+            # 1. Fetch file paths and local metadata (Uses unique fight_number keys)
+            file_path, fight = self._get_cut_file_path(fight_num)
             if not file_path or not fight:
                 raise ValueError("Localized file path configurations missing.")
 
@@ -2052,7 +2052,6 @@ class SumoVerifierApp(tk.Tk):
             self.after(0, lambda: row_widget.update_upload_state(True, "Obtaining intent..."))
             intent_url = f"{SUMOSTATS_API}/api/v1/videos/upload-intent"
 
-            # Cast all IDs and fields explicitly to enforce numerical validation checks
             payload_data = {
                 "result_id": int(bout_id),
                 "basho_id": int(self._torikumi_basho_id),
@@ -2071,7 +2070,6 @@ class SumoVerifierApp(tk.Tk):
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     intent_res = json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as he:
-                # Capture the explicit JSON error message hidden inside Python's HTTPError response body
                 error_body = he.read().decode("utf-8", errors="ignore")
                 try:
                     parsed_err = json.loads(error_body)
@@ -2132,12 +2130,14 @@ class SumoVerifierApp(tk.Tk):
             messagebox.showerror("Auth Error", "Please authenticate before launching bulk uploads.")
             return
 
-        # Gather all TorikumiRow components that have assigned fights
+        # Gather all assigned TorikumiRows cleanly matching via stable fight_number IDs
         matched_items = []
         for row in self._torikumi_rows:
-            assigned_lbl = row._var.get()
-            if assigned_lbl and assigned_lbl != "— none —":
-                matched_items.append((row._bout.get("id"), assigned_lbl, row))
+            assigned_val = row._var.get()
+            if assigned_val and assigned_val != "— none —":
+                fight_num = next((num for num, txt in row._fight_options if txt == assigned_val), None)
+                if fight_num is not None:
+                    matched_items.append((row._bout.get("id"), fight_num, row))
 
         if not matched_items:
             messagebox.showinfo("No Matches", "No fights have been assigned to Torikumi bouts yet.")
@@ -2157,25 +2157,22 @@ class SumoVerifierApp(tk.Tk):
         threading.Thread(target=self._run_batch_worker, args=(matched_items,), daemon=True).start()
 
     def _run_batch_worker(self, matched_items):
-        success_count = 0
-        failure_count = 0
+        import concurrent.futures
 
-        for bout_id, label, row_widget in matched_items:
-            # Re-verify and focus on active UI element
+        def process_item(item):
+            bout_id, fight_num, row_widget = item
             self.after(0, lambda rw=row_widget: rw.update_upload_state(True, "Starting..."))
+            return self._run_upload_flow_bg(bout_id, fight_num, row_widget)
 
-            # Execute standard flow synchronously inside this background worker thread
-            completed = self._run_upload_flow_bg(bout_id, label, row_widget)
+        # Spawns 5 parallel worker threads (SumoStats API recommended sweet spot)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            results = list(executor.map(process_item, matched_items))
 
-            if completed:
-                success_count += 1
-            else:
-                failure_count += 1
+        success_count = sum(1 for r in results if r)
+        failure_count = len(results) - success_count
 
-        # Restore Batch button visual settings
         self.after(0, lambda: self._batch_upload_btn.config(state="normal", text="⚡ Cut & Upload All Matched"))
 
-        # Display Batch Execution Summary
         msg = f"Batch upload processing complete.\n\nSuccessfully Uploaded: {success_count}\nFailures: {failure_count}"
         if failure_count > 0:
             self.after(0, lambda: messagebox.showwarning("Batch Run Summary", msg))
